@@ -26,25 +26,33 @@ module FSR
         orig_command = "%s %s" % [api_method, raw]
         Log.debug "saying #{orig_command}"
         resp = @fs_socket.say(orig_command)
-        unless resp["body"] == "0 total."
-          call_info, count = resp["body"].split("\n\n")
-          require "fsr/model/call"
-          require "csv"
-          @calls = CSV.parse(call_info, liberal_parsing: true)
-          return @calls[1 .. -1].map { |c| FSR::Model::Call.new(@calls[0],*c) }
+        body = resp["body"].to_s.strip
+        return [] if body.empty? || body == "0 total." || body.start_with?("-ERR")
+
+        require "fsr/model/call"
+        require "json"
+
+        # Use JSON output from FreeSWITCH - avoids CSV parsing issues with fields containing commas
+        begin
+          data = JSON.parse(body)
+          rows = data["rows"] || []
+          @calls = rows.map { |row| FSR::Model::Call.new(row.keys, *row.values) }
+          return @calls
+        rescue JSON::ParserError => e
+          Log.error "Failed to parse calls JSON: #{e.message}"
+          return []
         end
-        []
       end
 
       # This method builds the API command to send to the freeswitch event socket
       def raw
         base = if @type.nil?
-          "show calls"
+          "show calls as json"
         else
-          "show %s_calls" % @type
+          "show %s_calls as json" % @type
         end
         if @filter
-          "%s like '%s'" % [base, @filter]
+          "%s like '%s'" % [base.sub(' as json', ''), @filter] + " as json"
         else
           base
         end

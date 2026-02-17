@@ -26,40 +26,37 @@ module FSR
           Log.warn "This server does not support #{raw}, trying Calls"
           return Calls.new(@fs_socket, :detailed).run
         else
-          unless resp["body"] == "0 total."
-            call_info, count = resp["body"].split("\n\n")
-            require "fsr/model/channel"
-            require "csv"
-            
-            if call_info.match(/\{([^)]+)\}/)
-              call_info.match(/\{([^)]+)\}/)[0...-1].each do |m|
-                ss = m.gsub(',', ';')
-                call_info = call_info.gsub(m, ss)
-              end
-            end
-            call_info = call_info.gsub("set,", "set;")
-            call_info = call_info.gsub(",loopback", ";loopback")
-            channels = CSV.parse(call_info, liberal_parsing: true) 
-            headers = channels[0]
-            @channels = channels[1 .. -1].map { |c| FSR::Model::Channel.new(headers ,*c) }
+          body = resp["body"].to_s.strip
+          return [] if body.empty? || body == "0 total." || body.start_with?("-ERR")
+
+          require "fsr/model/channel"
+          require "json"
+
+          # Use JSON output from FreeSWITCH - avoids CSV parsing issues with fields containing commas
+          begin
+            data = JSON.parse(body)
+            rows = data["rows"] || []
+            @channels = rows.map { |row| FSR::Model::Channel.new(row.keys, *row.values) }
             return @channels
+          rescue JSON::ParserError => e
+            Log.error "Failed to parse channels JSON: #{e.message}"
+            return []
           end
-          []
         end
       end
 
       # This method builds the API command to send to the freeswitch event socket
       def raw
         if @filter === true
-          'show distinct_channels'
+          'show distinct_channels as json'
         elsif @filter.nil?
-          'show channels'
+          'show channels as json'
         elsif @filter.is_a?(Fixnum)
-          'show channels %d' % @filter
+          'show channels %d as json' % @filter
         elsif @filter.is_a?(String)
-          "show channels like '%s'" % @filter
+          "show channels like '%s' as json" % @filter
         else
-          'show channels'
+          'show channels as json'
         end
       end
     end
