@@ -91,6 +91,71 @@ module FSR
         FSR::Log.debug "Accepting connections."
       end
 
+      # The following protocol methods must be PUBLIC so that
+      # EventMachine::Protocols::HeaderAndContentProtocol can dispatch into
+      # them. EM HCP's `dispatch_request` uses `if respond_to?(:receive_request)`
+      # to decide whether to invoke the callback, and on Ruby ≥ 3.0 (actually
+      # since Ruby 2.0) `respond_to?` returns false for protected and private
+      # methods unless the second argument is passed. That means if
+      # receive_request is left protected, dispatch silently skips it and
+      # session_initiated never fires — a hard-to-diagnose failure mode.
+      # Visibility on these methods is a wire-protocol concern, not an
+      # access-control one; making them public is the correct fix.
+      public
+
+      # Anchored replacement for HeaderAndContentProtocol's ContentLengthPattern.
+      #
+      # The upstream EM pattern (/Content-length:\s*(\d+)/i) is unanchored and
+      # matches anywhere in a header line. That is benign for HTTP, where header
+      # values never contain dumped HTTP messages, but it is catastrophic for
+      # the FreeSWITCH event protocol: FS's `socket ... async full` dialplan
+      # invocation emits a CHANNEL_DATA event whose variable_sip_full_*
+      # headers carry whole SIP messages as their values, and a SIP message
+      # contains its own "Content-Length: N" line. The unanchored upstream
+      # regex picks up that embedded N, HCP switches into binary mode after the
+      # blank line, and the listener buffers forever waiting for body bytes
+      # that never arrive --- session_initiated is never called and the call
+      # silently times out with the caller hearing dead air.
+      #
+      # The anchored form here ensures we only treat a line beginning with
+      # "Content-Length:" as the real header, matching HTTP semantics.
+      OUTBOUND_CONTENT_LENGTH_PATTERN = /\AContent-length:\s*(\d+)/i
+
+      # Override of EventMachine::Protocols::HeaderAndContentProtocol#receive_line.
+      #
+      # Identical to the upstream implementation except for the constant used
+      # to detect the Content-Length header (see OUTBOUND_CONTENT_LENGTH_PATTERN
+      # above). We can't simply shadow ContentLengthPattern in this class
+      # because Ruby resolves it lexically inside HCP's own receive_line ---
+      # any constant defined here is invisible to that method. The shortest
+      # safe fix is to own this method outright.
+      def receive_line(line)
+        case @hc_mode
+        when :discard_blanks
+          unless line == ""
+            @hc_mode = :headers
+            receive_line line
+          end
+        when :headers
+          if line == ""
+            raise "unrecognized state" unless @hc_headers.length > 0
+            if @hc_content_length.to_i > 0
+              set_binary_mode @hc_content_length
+            else
+              dispatch_request
+            end
+          else
+            @hc_headers << line
+            if OUTBOUND_CONTENT_LENGTH_PATTERN =~ line
+              raise "extraneous content-length header" if @hc_content_length
+              @hc_content_length = $1.to_i
+            end
+          end
+        else
+          raise "internal error, unsupported mode"
+        end
+      end
+
       # receive_request is called each time data is received by the event machine
       #  it will manipulate the received data into either a new session or a reply,
       #  to be picked up by #session_initiated or #receive_reply.

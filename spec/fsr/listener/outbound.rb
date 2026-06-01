@@ -142,4 +142,34 @@ EM.describe MyListener do
     done
   end
 
+  # Regression test for the ringrx_1.1 fork patch.
+  #
+  # When FreeSWITCH sends a CHANNEL_DATA event in `async full` mode, the event
+  # has no top-level Content-Length and is terminated by a blank line. But the
+  # channel variables it carries can include things like variable_sip_full_*,
+  # whose VALUES are entire SIP messages and therefore contain their own
+  # "Content-Length: N" line. The base EM HCP regex (/Content-length:\s*(\d+)/i)
+  # is unanchored and matches anywhere in a header line, so it would pick up
+  # the embedded N, switch to binary mode after the blank line, and buffer
+  # forever waiting for body bytes that never arrive. session_initiated would
+  # never fire and the call would silently time out.
+  #
+  # The override of receive_line in FSR::Listener::Outbound uses an anchored
+  # pattern (OUTBOUND_CONTENT_LENGTH_PATTERN) so only true line-start
+  # "Content-Length:" headers are honored.
+  should "not be confused by Content-Length substrings embedded inside header values" do
+    @listener.receive_data(
+      "Event-Name: CHANNEL_DATA\n" \
+      "Unique-ID: abc-123\n" \
+      "variable_x_mailboxid: 1000@example.com\n" \
+      "variable_sip_full_invite: INVITE sip:host Content-Length: 456 More-Stuff: yes\n" \
+      "Channel-Name: sofia/internal/1000\n" \
+      "\n"
+    )
+    @listener.session.class.should.equal FSR::Listener::HeaderAndContentResponse
+    @listener.session.headers[:event_name].should.equal "CHANNEL_DATA"
+    @listener.session.headers[:variable_x_mailboxid].should.equal "1000@example.com"
+    done
+  end
+
 end
